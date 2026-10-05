@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import time
 from dataclasses import dataclass, fields
 from typing import Any
@@ -37,6 +38,9 @@ PRICES_PER_M = {
     "text-embedding-3-small": (0.02, 0.0),
     "text-embedding-3-large": (0.13, 0.0),
     "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-flash-latest": (0.10, 0.40),
+    "gemini-flash-lite-latest": (0.075, 0.30),
+    "gemini-3.5-flash-lite": (0.075, 0.30),
     # Gemini embedding pricing intentionally omitted: the current pricing page does not list gemini-embedding-001.
     "claude-opus-5-5": (4.00, 20.00),
     "claude-sonnet-5-5": (2.00, 10.00),
@@ -119,19 +123,34 @@ class MeteredLLM:
         if self.chat_provider == "anthropic":
             text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
         else:
+            kwargs = {
+                "model": self.chat_model_id,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0,
+            }
             if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    response_format={"type": "json_object"},
-                )
+                kwargs["response_format"] = {"type": "json_object"}
+
+            last_err = None
+            for attempt in range(20):
+                try:
+                    start = time.perf_counter()
+                    response = self._chat_client.chat.completions.create(**kwargs)
+                    break
+                except Exception as e:
+                    last_err = e
+                    err_msg = str(e).lower()
+                    if any(code in err_msg for code in ["429", "503", "500", "502", "504", "ratelimit", "resource_exhausted", "quota", "unavailable"]):
+                        delay = 14.0 if ("429" in err_msg or "quota" in err_msg) else 5.0
+                        m = re.search(r"retry in ([\d\.]+)s", str(e), re.IGNORECASE)
+                        if m:
+                            delay = float(m.group(1)) + 1.0
+                        time.sleep(delay)
+                    else:
+                        raise
             else:
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                )
+                if last_err:
+                    raise last_err
             text, model = response.choices[0].message.content or "", self.chat_model_id
             usage = response.usage
             tokens_in = usage.prompt_tokens if usage else 0
@@ -157,8 +176,26 @@ class MeteredLLM:
         return text, response.model, response.usage.input_tokens, response.usage.output_tokens
 
     def embed(self, text: str) -> list[float]:
-        start = time.perf_counter()
-        response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+        last_err = None
+        for attempt in range(20):
+            try:
+                start = time.perf_counter()
+                response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+                break
+            except Exception as e:
+                last_err = e
+                err_msg = str(e).lower()
+                if any(code in err_msg for code in ["429", "503", "500", "502", "504", "ratelimit", "resource_exhausted", "quota", "unavailable"]):
+                    delay = 14.0 if ("429" in err_msg or "quota" in err_msg) else 5.0
+                    m = re.search(r"retry in ([\d\.]+)s", str(e), re.IGNORECASE)
+                    if m:
+                        delay = float(m.group(1)) + 1.0
+                    time.sleep(delay)
+                else:
+                    raise
+        else:
+            if last_err:
+                raise last_err
         tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
         self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
         return [float(value) for value in response.data[0].embedding]

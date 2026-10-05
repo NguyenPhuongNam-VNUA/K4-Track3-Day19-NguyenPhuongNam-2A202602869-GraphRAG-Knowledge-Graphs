@@ -54,9 +54,26 @@ def normalize_crime(name: str) -> str:
 
 def link_entity(name: str, known: list[str], normalize: Callable[[str], str] = normalize_crime) -> str | None:
     """Map a free-text mention (e.g. a charge written by a journalist) onto one canonical name in `known`."""
-    # TODO KG-1: normalize both sides, exact match first, then difflib.get_close_matches(cutoff=0.8).
-    #            Return the ORIGINAL spelling from `known`; return None when nothing is close enough.
-    raise NotImplementedError("TODO KG-1 link_entity (src/graph.py) - kiểm tra: pytest tests/test_graph.py -k LinkEntity")
+    if not name or not known:
+        return None
+    norm_name = normalize(name)
+    if not norm_name:
+        return None
+
+    norm_to_orig: dict[str, str] = {}
+    for k in known:
+        norm_k = normalize(k)
+        if norm_k not in norm_to_orig:
+            norm_to_orig[norm_k] = k
+
+    if norm_name in norm_to_orig:
+        return norm_to_orig[norm_name]
+
+    matches = difflib.get_close_matches(norm_name, list(norm_to_orig.keys()), n=1, cutoff=0.8)
+    if matches:
+        return norm_to_orig[matches[0]]
+
+    return None
 
 def find_substances(text: str) -> list[str]:
     lowered = text.lower()
@@ -123,8 +140,15 @@ def extract_news_cases(doc: Document, llm_fn: Callable[[str], str], known_crimes
         title=doc.metadata.get("title", ""), content=doc.content[:12000],
     )
     try:
-        cases = json.loads(llm_fn(prompt)).get("cases", [])
-    except (json.JSONDecodeError, AttributeError):
+        raw = llm_fn(prompt)
+        if isinstance(raw, str):
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1] if "\n" in raw else ""
+                raw = raw.rsplit("```", 1)[0].strip()
+        data = json.loads(raw)
+        cases = data.get("cases", []) if isinstance(data, dict) else []
+    except (json.JSONDecodeError, AttributeError, TypeError):
         return []
     for case in cases:
         case["charges"] = sorted({c for c in (link_entity(x, known_crimes) for x in case.get("charges", [])) if c})
@@ -248,32 +272,125 @@ class Neo4jGraph:
 
     def context(self, question: str, doc_ids: list[str], max_facts: int = 60) -> list[str]:
         """Graph facts for a question: seeds + 1 hop, then the legal basis of every case reached."""
-        # TODO KG-3: multi-hop retrieval over YOUR ontology.
-        #   1. self.seed_facts(question, doc_ids) -> (seed_ids, facts)   (ontology-independent, already written)
-        #   2. From the seeds, walk to the other KB through your bridge node (Cypher, see LAB_GUIDE Bước 5)
-        #   3. Append one readable string per fact; return the list.
-        #
-        # HINT (suggested ontology):
-        #   a. Cases that are a seed or next to one -> add f"Vụ việc '{name}': {summary}" to facts
-        #        MATCH (k:Case) WHERE elementId(k) IN $ids OR EXISTS { MATCH (s)--(k) WHERE elementId(s) IN $ids }
-        #   b. For those cases follow
-        #        (Case)-[:CHARGED_WITH]->(Crime)<-[:DEFINES]-(Article)-[:HAS_CLAUSE]->(Clause)
-        #      keep clause 1 + clauses that MENTION a Substance the case INVOLVES
-        #   c. Articles named in the question ("Điều 251" -> re.findall(r"[Đđ]iều (\d+)", question)):
-        #      clause 1 + clauses mentioning find_substances(question)
-        #   d. One fact per clause: f"[{article_id} - {title}] khoản {number}: {text}"
-        raise NotImplementedError("TODO KG-3 Neo4jGraph.context (src/graph.py) - kiểm tra: python bench_kg.py --check")
+        seed_ids, facts = self.seed_facts(question, doc_ids)
+
+        # 1. Cases that are a seed or adjacent to one
+        case_rows = self.run(
+            """
+            MATCH (k:Case)
+            WHERE elementId(k) IN $ids OR EXISTS { MATCH (s)--(k) WHERE elementId(s) IN $ids }
+            OPTIONAL MATCH (p:Person)-[inv:INVOLVED_IN]->(k)
+            OPTIONAL MATCH (k)-[inv_sub:INVOLVES]->(sub:Substance)
+            RETURN elementId(k) AS id, k.name AS name, k.summary AS summary,
+                   collect(DISTINCT p.name) AS people,
+                   collect(DISTINCT sub.name) AS substances
+            """,
+            ids=seed_ids,
+        )
+
+        case_ids = []
+        for row in case_rows:
+            case_ids.append(row["id"])
+            people_str = f" (Người liên quan: {', '.join(row['people'])})" if row.get("people") else ""
+            subs_str = f" (Chất liên quan: {', '.join(row['substances'])})" if row.get("substances") else ""
+            facts.append(f"Vụ việc '{row['name']}': {row['summary']}{people_str}{subs_str}")
+
+        # 2. For those cases, traverse to law articles and clauses:
+        # (Case)-[:CHARGED_WITH]->(Crime)<-[:DEFINES]-(Article)-[:HAS_CLAUSE]->(Clause)
+        if case_ids:
+            clause_rows = self.run(
+                """
+                MATCH (k:Case)-[:CHARGED_WITH]->(c:Crime)<-[:DEFINES]-(a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+                WHERE elementId(k) IN $case_ids
+                OPTIONAL MATCH (k)-[:INVOLVES]->(s:Substance)<-[:MENTIONS]-(cl)
+                WITH a, cl, count(s) AS matching_substances
+                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.penalty AS penalty, cl.text AS text,
+                                matching_substances
+                ORDER BY a.id, cl.number
+                """,
+                case_ids=case_ids,
+            )
+            max_numbers = {}
+            for r in clause_rows:
+                aid = r["article_id"]
+                max_numbers[aid] = max(max_numbers.get(aid, 0), r["number"])
+
+            q_subs = [s.lower() for s in find_substances(question)]
+            for r in clause_rows:
+                is_clause_1 = (r["number"] == 1)
+                is_substance_match = (r["matching_substances"] > 0)
+                is_q_sub_match = any(qs in r["text"].lower() for qs in q_subs)
+                is_max_clause = (r["number"] == max_numbers.get(r["article_id"], 0))
+
+                if is_clause_1 or is_substance_match or is_q_sub_match or is_max_clause:
+                    facts.append(f"[{r['article_id']} - {r['title']}] khoản {r['number']}: {r['text']}")
+
+        # 3. Direct article references in the question (e.g. "Điều 251")
+        mentioned_articles = re.findall(r"[Đđ]iều\s+(\d+)", question)
+        if mentioned_articles:
+            article_patterns = [f"Điều {num}" for num in mentioned_articles]
+            direct_clauses = self.run(
+                """
+                MATCH (a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+                WHERE any(pat IN $patterns WHERE a.id CONTAINS pat)
+                RETURN a.id AS article_id, a.title AS title, cl.number AS number, cl.penalty AS penalty, cl.text AS text
+                ORDER BY a.id, cl.number
+                """,
+                patterns=article_patterns,
+            )
+            max_numbers = {}
+            for r in direct_clauses:
+                aid = r["article_id"]
+                max_numbers[aid] = max(max_numbers.get(aid, 0), r["number"])
+
+            q_subs = [s.lower() for s in find_substances(question)]
+            for r in direct_clauses:
+                is_clause_1 = (r["number"] == 1)
+                is_q_sub_match = any(qs in r["text"].lower() for qs in q_subs)
+                is_max_clause = (r["number"] == max_numbers.get(r["article_id"], 0))
+                if is_clause_1 or is_q_sub_match or is_max_clause:
+                    facts.append(f"[{r['article_id']} - {r['title']}] khoản {r['number']}: {r['text']}")
+
+        # 4. Direct substance references in the question (for aggregation questions like Q6)
+        q_substances = find_substances(question)
+        if q_substances:
+            sub_cases = self.run(
+                """
+                MATCH (k:Case)-[:INVOLVES]->(sub:Substance)
+                WHERE any(qs IN $substances WHERE toLower(sub.name) = toLower(qs))
+                OPTIONAL MATCH (p:Person)-[inv:INVOLVED_IN]->(k)
+                RETURN k.name AS name, k.summary AS summary, sub.name AS substance,
+                       collect(DISTINCT p.name) AS people
+                """,
+                substances=q_substances,
+            )
+            for r in sub_cases:
+                people_str = f" (Người liên quan: {', '.join(r['people'])})" if r.get("people") else ""
+                facts.append(f"Vụ việc liên quan {r['substance']}: '{r['name']}' - {r['summary']}{people_str}")
+
+        seen = set()
+        unique_facts = []
+        for f in facts:
+            if f not in seen:
+                seen.add(f)
+                unique_facts.append(f)
+
+        return unique_facts[:max_facts]
 
 # ---------------------------------------------------------------------------------------------- KG-2
 
 def build_graph(graph: Neo4jGraph, law_docs: list[Document], news_docs: list[Document],
                 llm_fn: Callable[..., str]) -> None:
     """Load both KBs into an empty graph. llm_fn(prompt, json_mode=False) -> str (metered OpenAI chat)."""
-    # TODO KG-2: create YOUR ontology in Neo4j from both KBs.
-    #   Contract: every node created from one document has the property doc_id = Document.id.
-    #   Fastest start: the HINT helpers above (parse_law_article, extract_news_cases, suggested_constraints,
-    #   add_law_article, add_news_case). Own ontology + report/ONTOLOGY.md = bonus (SUBMISSION.md).
-    raise NotImplementedError("TODO KG-2 build_graph (src/graph.py) - kiểm tra: python bench_kg.py --build --limit 2")
+    graph.suggested_constraints()
+    articles = [parse_law_article(d) for d in law_docs]
+    for a in articles:
+        graph.add_law_article(a)
+    crimes = [a["crime"] for a in articles if a["crime"]]
+    for d in news_docs:
+        cases = extract_news_cases(d, lambda p: llm_fn(p, json_mode=True), crimes)
+        for case in cases:
+            graph.add_news_case(case, d)
 
 # ---------------------------------------------------------------------------------------------- KG-4
 
@@ -298,6 +415,14 @@ class GraphRAGAgent:
         self.llm_fn = llm_fn
 
     def answer(self, question: str, top_k: int = 3) -> str:
-        # TODO KG-4: vector top-k (same as flat RAG) -> doc_ids of the hits -> self.graph.context(question, doc_ids)
-        #            -> fill GRAPH_PROMPT -> self.llm_fn(prompt)
-        raise NotImplementedError("TODO KG-4 GraphRAGAgent.answer (src/graph.py) - kiểm tra: pytest tests/test_graph.py -k GraphRAGAgent")
+        chunks = self.store.search(question, top_k=top_k)
+        doc_ids = list(dict.fromkeys(
+            chunk["metadata"]["doc_id"]
+            for chunk in chunks
+            if "metadata" in chunk and "doc_id" in chunk["metadata"]
+        ))
+        facts = self.graph.context(question, doc_ids)
+        facts_text = "\n".join(f"- {fact}" for fact in facts) if facts else "Không có dữ kiện graph bổ sung."
+        chunks_text = "\n\n".join(f"[{i}] {chunk['content']}" for i, chunk in enumerate(chunks, start=1)) if chunks else "Không tìm thấy đoạn văn bản."
+        prompt = GRAPH_PROMPT.format(facts=facts_text, chunks=chunks_text, question=question)
+        return self.llm_fn(prompt)
